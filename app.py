@@ -1,18 +1,19 @@
+from datetime import datetime, timezone
 from flask import Flask, jsonify, request
 import requests
 
 app = Flask(__name__)
 
-# Bufor na datę z 3 sygnałów POST (zostaje po staremu)
-device_date_state = {"signals": {}, "day": 1, "month": 1, "year": 2024}
+# Bufor na datę z 3 sygnałów POST (domyślnie 1 listopada 2024)
+device_date_state = {"signals": {}, "day": 1, "month": 11, "year": 2024}
 
-# Licznik dla żądań GET (cykl 8 sygnałów: 0 do 7)
+# Zapasowy licznik dla żądań GET (cykl 8 sygnałów: 0 do 7)
 get_counter = 0
 
 
 @app.route("/")
 def home():
-  return "Serwer Build Logic działa poprawnie!"
+  return "Serwer Build Logic działa poprawnie (tryb historyczny)"
 
 
 @app.route("/sync", methods=["GET", "POST"])
@@ -42,7 +43,6 @@ def sync_endpoint():
       else:
         byte_val = int(float(val_str))
 
-      # Dla POST daty zostawiamy 2 bity nagłówka i 6 bitów danych
       header = (byte_val >> 6) & 0b11
       payload = byte_val & 0x3F
 
@@ -67,7 +67,7 @@ def sync_endpoint():
         device_date_state["month"] = month
         device_date_state["year"] = year
         device_date_state["signals"] = {}
-        print(f"Zapisano datę: {day}/{month}/{year}")
+        print(f"Zapisano nową datę historyczną: {day}/{month}/{year}")
 
       return "1", 200
 
@@ -76,56 +76,73 @@ def sync_endpoint():
       return "0", 400
 
   # ==========================================
-  # 2. OBSŁUGA ODBIERANIA (GET) - Cyfry BCD BTC (2 miejsca po przecinku)
+  # 2. OBSŁUGA ODBIERANIA (GET) - Historyczna cena BTC
   # ==========================================
   elif request.method == "GET":
     user_agent = request.headers.get("User-Agent", "")
 
-    try:
-      res = requests.get(
-          "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
-          timeout=5,
-      )
-      btc_price = float(res.json()["price"])
-    except Exception as e:
-      print(f"Błąd pobierania Binance: {e}")
-      btc_price = 95432.18
+    y = device_date_state["year"]
+    m = device_date_state["month"]
+    d = device_date_state["day"]
 
-    # Mnożymy cenę przez 100, aby zamienić ją na całkowitą liczbę centów
+    btc_price = 70000.0  # Fallback w razie błędu API
+    try:
+      # Precyzyjne obliczenie timestampu w UTC dla konkretnego dnia
+      dt = datetime(y, m, d, tzinfo=timezone.utc)
+      start_ts = int(dt.timestamp() * 1000)
+      end_ts = start_ts + 86400000  # +24h w milisekundach
+
+      url = (
+          f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d"
+          f"&startTime={start_ts}&endTime={end_ts}&limit=1"
+      )
+      res = requests.get(url, timeout=5)
+      data = res.json()
+      if data and len(data) > 0:
+        btc_price = float(data[0][4])  # Cena zamknięcia (Close)
+    except Exception as e:
+      print(f"Błąd pobierania historycznego z Binance dla {d}/{m}/{y}: {e}")
+
+    # Konwersja ceny na centy (2 miejsca po przecinku)
     total_cents = int(round(btc_price * 100))
 
-    # Wyciągamy poszczególne cyfry dziesiętne z centów
-    d_100k = (total_cents // 10000000) % 10  # 100 tysięcy
-    d_10k = (total_cents // 1000000) % 10  # 10 tysięcy
-    d_1k = (total_cents // 100000) % 10  # Tysiące
-    d_100 = (total_cents // 10000) % 10  # Setki
-    d_10 = (total_cents // 1000) % 10  # Dziesiątki
-    d_1 = (total_cents // 100) % 10  # Jedności
-    d_dec1 = (total_cents // 10) % 10  # 1. cyfra po przecinku (dziesiąte)
-    d_dec2 = total_cents % 10  # 2. cyfra po przecinku (setne)
+    d_100k = (total_cents // 10000000) % 10
+    d_10k = (total_cents // 1000000) % 10
+    d_1k = (total_cents // 100000) % 10
+    d_100 = (total_cents // 10000) % 10
+    d_10 = (total_cents // 1000) % 10
+    d_1 = (total_cents // 100) % 10
+    d_dec1 = (total_cents // 10) % 10
+    d_dec2 = total_cents % 10
 
-    # 4 bity nagłówka (bity 7-4) + 4 bity cyfry BCD (bity 3-0)
+    # 8 sygnałów (nagłówek 4 bity + cyfra BCD 4 bity)
     signals_list = [
-        (0b0000 << 4) | (d_100k & 0x0F),  # Sygnał 0: 100k
-        (0b0001 << 4) | (d_10k & 0x0F),  # Sygnał 1: 10k
-        (0b0010 << 4) | (d_1k & 0x0F),  # Sygnał 2: 1k
-        (0b0011 << 4) | (d_100 & 0x0F),  # Sygnał 3: Setki
-        (0b0100 << 4) | (d_10 & 0x0F),  # Sygnał 4: Dziesiątki
-        (0b0101 << 4) | (d_1 & 0x0F),  # Sygnał 5: Jedności
-        (0b0110 << 4) | (d_dec1 & 0x0F),  # Sygnał 6: .X
-        (0b0111 << 4) | (d_dec2 & 0x0F),  # Sygnał 7: .XX
+        (0b0000 << 4) | (d_100k & 0x0F),
+        (0b0001 << 4) | (d_10k & 0x0F),
+        (0b0010 << 4) | (d_1k & 0x0F),
+        (0b0011 << 4) | (d_100 & 0x0F),
+        (0b0100 << 4) | (d_10 & 0x0F),
+        (0b0101 << 4) | (d_1 & 0x0F),
+        (0b0110 << 4) | (d_dec1 & 0x0F),
+        (0b0111 << 4) | (d_dec2 & 0x0F),
     ]
 
-    current_signal = signals_list[get_counter]
+    # Obsługa jawnego kroku z URL (np. ?step=0 do 7) lub automatyczny licznik
+    step_param = request.args.get("step") or request.args.get("index")
+    if step_param is not None and step_param.isdigit():
+      current_step = int(step_param) % 8
+    else:
+      current_step = get_counter
+      get_counter = (get_counter + 1) % 8
+
+    current_signal = signals_list[current_step]
     bin_str = format(current_signal, "08b")
 
     print(
-        f"GET - Sygnał nr {get_counter}: {bin_str} (Cyfra:"
-        f" {current_signal & 0x0F}, Cena: {btc_price}) [Agent: {user_agent}]"
+        f"GET (Data {d}/{m}/{y}) - Sygnał nr {current_step}: {bin_str} (Cyfra:"
+        f" {current_signal & 0x0F}, Cena historyczna: {btc_price})"
+        f" [Agent: {user_agent}]"
     )
-
-    # Zwiększamy licznik w cyklu 8-elementowym (0 do 7)
-    get_counter = (get_counter + 1) % 8
 
     return jsonify({"value": bin_str})
 
