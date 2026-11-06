@@ -3,10 +3,10 @@ import requests
 
 app = Flask(__name__)
 
-# Bufor na datę z 3 sygnałów POST
+# Bufor na datę z 3 sygnałów POST (zostaje po staremu)
 device_date_state = {"signals": {}, "day": 1, "month": 1, "year": 2024}
 
-# Licznik dla żądań GET (sygnały 0, 1, 2, 3)
+# Licznik dla żądań GET (cykl 8 sygnałów: 0 do 7)
 get_counter = 0
 
 
@@ -42,6 +42,7 @@ def sync_endpoint():
       else:
         byte_val = int(float(val_str))
 
+      # Dla POST daty zostawiamy 2 bity nagłówka i 6 bitów danych
       header = (byte_val >> 6) & 0b11
       payload = byte_val & 0x3F
 
@@ -75,7 +76,7 @@ def sync_endpoint():
       return "0", 400
 
   # ==========================================
-  # 2. OBSŁUGA ODBIERANIA (GET) - Kurs BTC
+  # 2. OBSŁUGA ODBIERANIA (GET) - Cyfry BCD BTC (2 miejsca po przecinku)
   # ==========================================
   elif request.method == "GET":
     user_agent = request.headers.get("User-Agent", "")
@@ -88,31 +89,43 @@ def sync_endpoint():
       btc_price = float(res.json()["price"])
     except Exception as e:
       print(f"Błąd pobierania Binance: {e}")
-      btc_price = 65432.1
+      btc_price = 95432.18
 
-    integer_part = int(btc_price)
-    decimal_part = int((btc_price - integer_part) * 10) & 0x0F
+    # Mnożymy cenę przez 100, aby zamienić ją na całkowitą liczbę centów
+    total_cents = int(round(btc_price * 100))
 
-    s0_data = (integer_part >> 12) & 0b111111
-    s1_data = (integer_part >> 6) & 0b111111
-    s2_data = integer_part & 0b111111
-    s3_data = (decimal_part << 2) & 0b111111
+    # Wyciągamy poszczególne cyfry dziesiętne z centów
+    d_100k = (total_cents // 10000000) % 10  # 100 tysięcy
+    d_10k = (total_cents // 1000000) % 10  # 10 tysięcy
+    d_1k = (total_cents // 100000) % 10  # Tysiące
+    d_100 = (total_cents // 10000) % 10  # Setki
+    d_10 = (total_cents // 1000) % 10  # Dziesiątki
+    d_1 = (total_cents // 100) % 10  # Jedności
+    d_dec1 = (total_cents // 10) % 10  # 1. cyfra po przecinku (dziesiąte)
+    d_dec2 = total_cents % 10  # 2. cyfra po przecinku (setne)
 
+    # 4 bity nagłówka (bity 7-4) + 4 bity cyfry BCD (bity 3-0)
     signals_list = [
-        (0 << 6) | s0_data,
-        (1 << 6) | s1_data,
-        (2 << 6) | s2_data,
-        (3 << 6) | s3_data,
+        (0b0000 << 4) | (d_100k & 0x0F),  # Sygnał 0: 100k
+        (0b0001 << 4) | (d_10k & 0x0F),  # Sygnał 1: 10k
+        (0b0010 << 4) | (d_1k & 0x0F),  # Sygnał 2: 1k
+        (0b0011 << 4) | (d_100 & 0x0F),  # Sygnał 3: Setki
+        (0b0100 << 4) | (d_10 & 0x0F),  # Sygnał 4: Dziesiątki
+        (0b0101 << 4) | (d_1 & 0x0F),  # Sygnał 5: Jedności
+        (0b0110 << 4) | (d_dec1 & 0x0F),  # Sygnał 6: .X
+        (0b0111 << 4) | (d_dec2 & 0x0F),  # Sygnał 7: .XX
     ]
 
     current_signal = signals_list[get_counter]
-    
-    # Generowanie pełnego 8-bitowego ciągu zer i jedynek (np. "10011000")
-    bin_str = format(current_signal, '08b')
-    
-    print(f"GET - Wydaję sygnał nr {get_counter}: {bin_str} (liczba: {current_signal}) [Agent: {user_agent}]")
+    bin_str = format(current_signal, "08b")
 
-    get_counter = (get_counter + 1) % 4
+    print(
+        f"GET - Sygnał nr {get_counter}: {bin_str} (Cyfra:"
+        f" {current_signal & 0x0F}, Cena: {btc_price}) [Agent: {user_agent}]"
+    )
+
+    # Zwiększamy licznik w cyklu 8-elementowym (0 do 7)
+    get_counter = (get_counter + 1) % 8
 
     return jsonify({"value": bin_str})
 
