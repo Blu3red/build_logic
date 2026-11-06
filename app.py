@@ -80,7 +80,7 @@ def sync_endpoint():
   # ==========================================
   # 2. OBSŁUGA ODBIERANIA (GET) - Kurs BTC
   # ==========================================
-  elif request.method == "GET":
+elif request.method == "GET":
     try:
       res = requests.get(
           "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
@@ -91,29 +91,31 @@ def sync_endpoint():
       print(f"Błąd pobierania Binance: {e}")
       btc_price = 65432.1
 
-    # Rozbicie ceny na część całkowitą i pierwszą cyfrę po przecinku
     integer_part = int(btc_price)
     decimal_part = int((btc_price - integer_part) * 10) & 0x0F
 
-    # Pakowanie w 4 sygnały (6 bitów danych + 2 bity nagłówka)
     s0_data = (integer_part >> 12) & 0b111111
     s1_data = (integer_part >> 6) & 0b111111
     s2_data = integer_part & 0b111111
     s3_data = (decimal_part << 2) & 0b111111
 
-    signal_0 = (0 << 6) | s0_data  # Nagłówek 00 (0)
-    signal_1 = (1 << 6) | s1_data  # Nagłówek 01 (1)
-    signal_2 = (2 << 6) | s2_data  # Nagłówek 10 (2)
-    signal_3 = (3 << 6) | s3_data  # Nagłówek 11 (3)
+    signals_list = [
+        (0 << 6) | s0_data,
+        (1 << 6) | s1_data,
+        (2 << 6) | s2_data,
+        (3 << 6) | s3_data,
+    ]
 
-    signals_list = [signal_0, signal_1, signal_2, signal_3]
+    current_signal = signals_list[get_counter]
+    
+    # KLUCZOWA ZMIANA: Tworzymy czysty 8-bitowy ciąg znaków (np. "10011000")
+    bin_str = format(current_signal, '08b')
+    
+    print(f"GET - Wydaję sygnał nr {get_counter}: {bin_str} (liczba: {current_signal})")
 
-    # Pobieramy kolejny sygnał w sekwencji (zwiększa się o 1 przy każdym zapytaniu GET)
-    current_signal = signals_list[get_counter % 4]
     get_counter = (get_counter + 1) % 4
 
-    # Zwracamy pojedynczą wartość w formacie JSON oczekiwanym przez blok
-    return jsonify({"value": str(current_signal)})
+    return jsonify({"value": bin_str})
 
 
 if __name__ == "__main__":
