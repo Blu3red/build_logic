@@ -3,10 +3,10 @@ import requests
 
 app = Flask(__name__)
 
-# Bufor na stan daty wysyłanej przez urządzenie (3 sygnały POST)
+# Bufor na datę z 3 sygnałów POST
 device_date_state = {"signals": {}, "day": 1, "month": 1, "year": 2024}
 
-# Licznik sekwencji dla żądań GET (wydaje kolejno sygnały 0, 1, 2, 3)
+# Licznik dla żądań GET (sygnały 0, 1, 2, 3)
 get_counter = 0
 
 
@@ -42,14 +42,11 @@ def sync_endpoint():
       else:
         byte_val = int(float(val_str))
 
-      # 2 bity nagłówka (identyfikator sygnału 0, 1 lub 2)
       header = (byte_val >> 6) & 0b11
-      # 6 bitów danych
       payload = byte_val & 0x3F
 
       device_date_state["signals"][header] = payload
 
-      # Gdy otrzymamy komplet 3 sygnałów (0, 1, 2)
       if all(k in device_date_state["signals"] for k in [0, 1, 2]):
         s0 = device_date_state["signals"][0]
         s1 = device_date_state["signals"][1]
@@ -69,8 +66,8 @@ def sync_endpoint():
         device_date_state["month"] = month
         device_date_state["year"] = year
         device_date_state["signals"] = {}
+        print(f"Zapisano datę: {day}/{month}/{year}")
 
-      # Potwierdzenie przyjęcia sygnału dla Twojego układu
       return "1", 200
 
     except Exception as e:
@@ -80,7 +77,9 @@ def sync_endpoint():
   # ==========================================
   # 2. OBSŁUGA ODBIERANIA (GET) - Kurs BTC
   # ==========================================
-elif request.method == "GET":
+  elif request.method == "GET":
+    user_agent = request.headers.get("User-Agent", "")
+
     try:
       res = requests.get(
           "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
@@ -108,10 +107,10 @@ elif request.method == "GET":
 
     current_signal = signals_list[get_counter]
     
-    # KLUCZOWA ZMIANA: Tworzymy czysty 8-bitowy ciąg znaków (np. "10011000")
+    # Generowanie pełnego 8-bitowego ciągu zer i jedynek (np. "10011000")
     bin_str = format(current_signal, '08b')
     
-    print(f"GET - Wydaję sygnał nr {get_counter}: {bin_str} (liczba: {current_signal})")
+    print(f"GET - Wydaję sygnał nr {get_counter}: {bin_str} (liczba: {current_signal}) [Agent: {user_agent}]")
 
     get_counter = (get_counter + 1) % 4
 
