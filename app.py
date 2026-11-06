@@ -15,8 +15,8 @@ def receive_device_data():
 
     # 2 starsze bity to nagłówek (identyfikator sygnału: 0, 1 lub 2)
     header = (byte_val >> 6) & 0b11
-    # 6 młodszych bitów to dane
-    payload = byte_val & 0b3F
+    # 6 młodszych bitów to dane (poprawiono z 0b3F na 0x3F)
+    payload = byte_val & 0x3F
 
     device_date_state["signals"][header] = payload
 
@@ -73,15 +73,12 @@ def roblox_get():
   decimal_part = int((btc_price - integer_part) * 10) & 0x0F
 
   # --- PAKOWANIE DO 4 SYGNALÓW GET (po 8 bitów: 2 bity nagłówka + 6 bitów danych) ---
-  # Pierwsze 18 bitów ceny całkowitej dzielimy na 3 części po 6 bitów
   s0_data = (integer_part >> 12) & 0b111111
   s1_data = (integer_part >> 6) & 0b111111
   s2_data = integer_part & 0b111111
-
-  # Ostatnie 6 bitów (4 bity na cyfrę po przecinku + 2 bity zapasowe na końcu)
   s3_data = (decimal_part << 2) & 0b111111
 
-  # Doklejamy 2 bity nagłówka (00, 01, 10, 11 -> wartości 0, 1, 2, 3)
+  # Doklejamy 2 bity nagłówka (0, 1, 2, 3 przesunięte o 6 bitów)
   signal_0 = (0 << 6) | s0_data
   signal_1 = (1 << 6) | s1_data
   signal_2 = (2 << 6) | s2_data
