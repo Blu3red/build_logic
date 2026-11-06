@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request
+from flask import Flask, request
 import requests
 
 app = Flask(__name__)
@@ -18,7 +18,6 @@ def home():
 @app.route("/device", methods=["POST", "GET"])
 def receive_device_data():
   try:
-    # Pobieramy wartość 'value' wysłaną przez blok w Robloxie (z formularza lub JSON)
     val_str = (
         request.form.get("value")
         or request.args.get("value")
@@ -31,27 +30,22 @@ def receive_device_data():
     if val_str is None:
       val_str = "0"
 
-    # Konwersja: jeśli to ciąg bitów (np. "00101010"), parsujemy binarnie, w przeciwieństwie jako zwykłą liczbę
     val_str = str(val_str).strip()
     if all(c in "01" for c in val_str) and len(val_str) > 1:
       byte_val = int(val_str, 2)
     else:
       byte_val = int(float(val_str))
 
-    # 2 starsze bity to nagłówek (identyfikator sygnału: 0, 1 lub 2)
     header = (byte_val >> 6) & 0b11
-    # 6 młodszych bitów to dane
     payload = byte_val & 0x3F
 
     device_date_state["signals"][header] = payload
 
-    # Gdy otrzymamy komplet 3 sygnałów (0, 1, 2)
     if all(k in device_date_state["signals"] for k in [0, 1, 2]):
       s0 = device_date_state["signals"][0]
       s1 = device_date_state["signals"][1]
       s2 = device_date_state["signals"][2]
 
-      # --- PARSANIE DATY ---
       day = s0 & 0x1F
 
       bit5_s0 = (s0 >> 5) & 0x01
@@ -67,15 +61,12 @@ def receive_device_data():
       device_date_state["month"] = month
       device_date_state["year"] = year
 
-      # Reset bufora
       device_date_state["signals"] = {}
 
-    # Zwracamy "1" jako potwierdzenie odebrania dla Twojego układu
     return "1", 200
 
   except Exception as e:
     print(f"Błąd parsowania: {e}")
-    # W razie anomalii zwracamy błąd, co wymusi powtórzenie transmisji w układzie
     return "0", 400
 
 
@@ -103,15 +94,9 @@ def roblox_get():
   signal_2 = (2 << 6) | s2_data
   signal_3 = (3 << 6) | s3_data
 
-  return jsonify({
-      "signals": [signal_0, signal_1, signal_2, signal_3],
-      "saved_date": {
-          "day": device_date_state["day"],
-          "month": device_date_state["month"],
-          "year": device_date_state["year"],
-      },
-      "raw_btc": btc_price,
-  })
+  # Zwracamy czysty tekst z 4 sygnałami oddzielonymi przecinkami
+  response_text = f"{signal_0},{signal_1},{signal_2},{signal_3}"
+  return response_text, 200, {"Content-Type": "text/plain"}
 
 
 if __name__ == "__main__":
