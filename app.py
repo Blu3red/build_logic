@@ -1,4 +1,4 @@
-from flask import Flask, request
+from flask import Flask, jsonify, request
 import requests
 
 app = Flask(__name__)
@@ -94,9 +94,11 @@ def roblox_get():
   signal_2 = (2 << 6) | s2_data
   signal_3 = (3 << 6) | s3_data
 
-  # Zwracamy czysty tekst z 4 sygnałami oddzielonymi przecinkami
-  response_text = f"{signal_0},{signal_1},{signal_2},{signal_3}"
-  return response_text, 200, {"Content-Type": "text/plain"}
+  # Łączymy 4 sygnały w string rozdzielony przecinkami wewnątrz klucza "value",
+  # którego ten blok oczekuje.
+  signals_str = f"{signal_0},{signal_1},{signal_2},{signal_3}"
+
+  return jsonify({"value": signals_str})
 
 
 if __name__ == "__main__":
