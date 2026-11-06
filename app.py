@@ -6,15 +6,22 @@ app = Flask(__name__)
 # Bufor na stan daty wysyłanej przez urządzenie (3 sygnały POST)
 device_date_state = {"signals": {}, "day": 1, "month": 1, "year": 2024}
 
+# Licznik sekwencji dla żądań GET (wydaje kolejno sygnały 0, 1, 2, 3)
+get_counter = 0
+
 
 @app.route("/")
 def home():
-  return "Serwer Build Logic działa poprawnie pod jednym adresem /sync"
+  return "Serwer Build Logic działa poprawnie!"
 
 
 @app.route("/sync", methods=["GET", "POST"])
 def sync_endpoint():
-  # 1. OBSŁUGA WYSYŁANIA (POST) - kiedy twój układ przesyła datę
+  global get_counter
+
+  # ==========================================
+  # 1. OBSŁUGA WYSYŁANIA (POST) - Zapis daty
+  # ==========================================
   if request.method == "POST":
     try:
       val_str = (
@@ -35,11 +42,14 @@ def sync_endpoint():
       else:
         byte_val = int(float(val_str))
 
+      # 2 bity nagłówka (identyfikator sygnału 0, 1 lub 2)
       header = (byte_val >> 6) & 0b11
+      # 6 bitów danych
       payload = byte_val & 0x3F
 
       device_date_state["signals"][header] = payload
 
+      # Gdy otrzymamy komplet 3 sygnałów (0, 1, 2)
       if all(k in device_date_state["signals"] for k in [0, 1, 2]):
         s0 = device_date_state["signals"][0]
         s1 = device_date_state["signals"][1]
@@ -60,39 +70,50 @@ def sync_endpoint():
         device_date_state["year"] = year
         device_date_state["signals"] = {}
 
-      # Zwracamy "1" jako potwierdzenie dla układu
+      # Potwierdzenie przyjęcia sygnału dla Twojego układu
       return "1", 200
 
     except Exception as e:
       print(f"Błąd POST: {e}")
       return "0", 400
 
-  # 2. OBSŁUGA ODBIERANIA (GET) - kiedy blok pobiera kurs BTC
+  # ==========================================
+  # 2. OBSŁUGA ODBIERANIA (GET) - Kurs BTC
+  # ==========================================
   elif request.method == "GET":
     try:
       res = requests.get(
-          "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd",
+          "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
           timeout=5,
       )
-      btc_price = res.json()["bitcoin"]["usd"]
-    except Exception:
+      btc_price = float(res.json()["price"])
+    except Exception as e:
+      print(f"Błąd pobierania Binance: {e}")
       btc_price = 65432.1
 
+    # Rozbicie ceny na część całkowitą i pierwszą cyfrę po przecinku
     integer_part = int(btc_price)
     decimal_part = int((btc_price - integer_part) * 10) & 0x0F
 
+    # Pakowanie w 4 sygnały (6 bitów danych + 2 bity nagłówka)
     s0_data = (integer_part >> 12) & 0b111111
     s1_data = (integer_part >> 6) & 0b111111
     s2_data = integer_part & 0b111111
     s3_data = (decimal_part << 2) & 0b111111
 
-    signal_0 = (0 << 6) | s0_data
-    signal_1 = (1 << 6) | s1_data
-    signal_2 = (2 << 6) | s2_data
-    signal_3 = (3 << 6) | s3_data
+    signal_0 = (0 << 6) | s0_data  # Nagłówek 00 (0)
+    signal_1 = (1 << 6) | s1_data  # Nagłówek 01 (1)
+    signal_2 = (2 << 6) | s2_data  # Nagłówek 10 (2)
+    signal_3 = (3 << 6) | s3_data  # Nagłówek 11 (3)
 
-    signals_str = f"{signal_0},{signal_1},{signal_2},{signal_3}"
-    return jsonify({"value": signals_str})
+    signals_list = [signal_0, signal_1, signal_2, signal_3]
+
+    # Pobieramy kolejny sygnał w sekwencji (zwiększa się o 1 przy każdym zapytaniu GET)
+    current_signal = signals_list[get_counter % 4]
+    get_counter = (get_counter + 1) % 4
+
+    # Zwracamy pojedynczą wartość w formacie JSON oczekiwanym przez blok
+    return jsonify({"value": str(current_signal)})
 
 
 if __name__ == "__main__":
