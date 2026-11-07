@@ -13,9 +13,7 @@ app.config["MAX_CONTENT_LENGTH"] = 1024
 # KONFIGURACJA
 # ==============================================================================
 LSB_FIRST = True  # True = wagi 1, 2, 4, 8 od lewej | False = wagi 8, 4, 2, 1
-SIGNAL_TIMEOUT = (
-    600.0  # 10 minut na spokojne wysłanie 3 sygnałów POST (nie skasuje w trakcie testów)
-)
+SIGNAL_TIMEOUT = 600.0  # 10 minut na spokojne wysłanie 3 sygnałów POST
 API_COOLDOWN = 1.0  # Ochrona przed spamem API (1 sekunda)
 STATE_FILE = "/tmp/btc_state.json"
 
@@ -58,8 +56,7 @@ def get_default_state():
     }
 
 
-def load_and_Lock_state():
-    """Odczytuje stan z pliku współdzielonego między wszystkie procesy na Render.com."""
+def load_and_lock_state():
     if not os.path.exists(STATE_FILE):
         with open(STATE_FILE, "w") as f:
             json.dump(get_default_state(), f)
@@ -74,7 +71,6 @@ def load_and_Lock_state():
 
 
 def save_and_unlock_state(f, data):
-    """Zapisuje stan i zwalnia blokadę pliku."""
     f.seek(0)
     f.truncate()
     json.dump(data, f)
@@ -93,18 +89,22 @@ def validate_date(day, month, year):
         dt = datetime(year, month, day, 0, 0, 0, tzinfo=timezone.utc)
         now = datetime.now(timezone.utc)
         if dt > now:
-            print(f"[ANOMALIA] Data z przyszłości: {day:02d}/{month:02d}/{year}")
+            print(
+                f"[ANOMALIA] Data z przyszłości: {day:02d}/{month:02d}/{year}",
+                flush=True,
+            )
             return None
-        # Bitcoin ma historię cenową od 17 lipca 2010 roku
         if dt < datetime(2010, 7, 17, tzinfo=timezone.utc):
             print(
-                f"[ANOMALIA] Data sprzed powstania giełd BTC (przed 17.07.2010): {day:02d}/{month:02d}/{year}"
+                f"[ANOMALIA] Data sprzed powstania giełd BTC (przed 17.07.2010): {day:02d}/{month:02d}/{year}",
+                flush=True,
             )
             return None
         return dt
     except ValueError:
         print(
-            f"[ANOMALIA] Nieistniejąca data w kalendarzu: {day}/{month}/{year}"
+            f"[ANOMALIA] Nieistniejąca data w kalendarzu: {day}/{month}/{year}",
+            flush=True,
         )
         return None
 
@@ -117,22 +117,19 @@ def get_btc_price_safe(day, month, year, state):
     date_key = f"{year:04d}-{month:02d}-{day:02d}"
     today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    # 1. Sprawdzenie pamięci Cache
     if date_key in state["cache"]:
         price = state["cache"][date_key]
-        print(f"[CACHE] Cena dla {date_key} z pamięci: {price} USD")
+        print(f"[CACHE] Cena dla {date_key} z pamięci: {price} USD", flush=True)
         return price
 
-    # 2. Anty-Spam
     now_ts = time.time()
     if now_ts - state["last_api_call"] < API_COOLDOWN:
-        print("[ANTY-SPAM] Zbyt szybkie zapytania do API!")
+        print("[ANTY-SPAM] Zbyt szybkie zapytania do API!", flush=True)
         return 0.0
     state["last_api_call"] = now_ts
 
-    # 3. Pobranie ceny z CryptoCompare API (działa od 2010 roku, brak blokad w USA/Render)
+    # 1. Główne API: CryptoCompare (historia od 2010 roku)
     try:
-        # CryptoCompare przyjmuje timestamp końca dnia UTC
         ts_sec = int(dt.timestamp())
         url = "https://min-api.cryptocompare.com/data/v2/histoday"
         params = {"fsym": "BTC", "tsym": "USD", "limit": 1, "toTs": ts_sec}
@@ -150,9 +147,9 @@ def get_btc_price_safe(day, month, year, state):
                         state["cache"][date_key] = close_price
                     return close_price
     except Exception as e:
-        print(f"[BŁĄD CryptoCompare] {e}")
+        print(f"[BŁĄD CryptoCompare] {e}", flush=True)
 
-    # 4. Zapasowe API: Binance (gdyby CryptoCompare miało przerwę, działa dla dat >= 2017)
+    # 2. Zapasowe API: Binance (dla dat >= 2017)
     try:
         url = "https://data-api.binance.vision/api/v3/klines"
         params = {
@@ -169,7 +166,7 @@ def get_btc_price_safe(day, month, year, state):
                 state["cache"][date_key] = close_price
             return close_price
     except Exception as e:
-        print(f"[BŁĄD Binance] {e}")
+        print(f"[BŁĄD Binance] {e}", flush=True)
 
     return 0.0
 
@@ -207,9 +204,15 @@ def extract_value_from_request(req):
     return None
 
 
-@app.route("/", methods=["POST", "GET"])
+@app.route("/", methods=["POST", "GET", "HEAD"])
 def handle_transmitter():
-    f, state = load_and_Lock_state()
+    user_agent = request.headers.get("User-Agent", "")
+
+    # Ignorujemy zapytania HEAD oraz bota sprawdzającego z Render.com (żeby nie przesuwał licznika GET!)
+    if request.method == "HEAD" or "Go-http-client" in user_agent:
+        return format_response("00000000")
+
+    f, state = load_and_lock_state()
     try:
         # ==========================================
         # ODBIERANIE DATY (POST)
@@ -219,7 +222,8 @@ def handle_transmitter():
 
             if val is None:
                 print(
-                    f"[ANOMALIA] Błędny pakiet POST: {request.get_data(as_text=True)}"
+                    f"[ANOMALIA] Błędny pakiet POST: {request.get_data(as_text=True)}",
+                    flush=True,
                 )
                 return format_response("000000" + to_bits(3, 2))
 
@@ -232,14 +236,17 @@ def handle_transmitter():
 
             # Sygnał #3 resetuje układ
             if sig_num == 3:
-                print("[RESET] Odebrano sygnał #3 -> Resetuję stan!")
+                print(
+                    "[RESET] Odebrano sygnał #3 -> Resetuję stan!", flush=True
+                )
                 state["post_signals"] = {"0": None, "1": None, "2": None}
                 state["get_index"] = 0
                 return format_response("000000" + to_bits(3, 2))
 
             state["post_signals"][str(sig_num)] = val
             print(
-                f"[POST] Odebrano Sygnał #{sig_num}: {val} | Stan bufora: {state['post_signals']}"
+                f"[POST] Odebrano Sygnał #{sig_num}: {val} | Stan bufora: {state['post_signals']}",
+                flush=True,
             )
 
             # Jeśli zebrano wszystkie 3 sygnały (0, 1, 2) -> dekodujemy datę i pobieramy cenę!
@@ -254,7 +261,10 @@ def handle_transmitter():
                 month = from_bits(s0[5] + s1[0:3])
                 year = 2000 + from_bits(s1[3:6] + s2[0:4])
 
-                print(f"=== ZDEKODOWANO DATĘ: {day:02d}/{month:02d}/{year} ===")
+                print(
+                    f"=== ZDEKODOWANO DATĘ: {day:02d}/{month:02d}/{year} ===",
+                    flush=True,
+                )
 
                 price = get_btc_price_safe(day, month, year, state)
                 state["price_bcd_packets"] = prepare_price_packets(price)
@@ -262,7 +272,8 @@ def handle_transmitter():
                 state["post_signals"] = {"0": None, "1": None, "2": None}
 
                 print(
-                    f"=== CENA BTC: {price:.2f} USD | PAKIETY GET: {state['price_bcd_packets']} ==="
+                    f"=== CENA BTC: {price:.2f} USD | PAKIETY GET: {state['price_bcd_packets']} ===",
+                    flush=True,
                 )
 
             return format_response("000000" + to_bits(sig_num, 2))
@@ -270,10 +281,10 @@ def handle_transmitter():
         # ==========================================
         # WYSYŁANIE CENY DO GRY (GET)
         # ==========================================
-        elif request.method == "GET":
+        else:
             idx = state["get_index"]
             packet_to_send = state["price_bcd_packets"][idx]
-            print(f"[GET] Wysyłam pakiet #{idx}/7: {packet_to_send}")
+            print(f"[GET] Wysyłam pakiet #{idx}/7: {packet_to_send}", flush=True)
             state["get_index"] = (idx + 1) % 8
             return format_response(packet_to_send)
 
@@ -283,7 +294,7 @@ def handle_transmitter():
 
 @app.errorhandler(Exception)
 def handle_exception(e):
-    print(f"[KRYTYCZNY WYJĄTEK] {e}")
+    print(f"[KRYTYCZNY WYJĄTEK] {e}", flush=True)
     return format_response("00000011")
 
 
