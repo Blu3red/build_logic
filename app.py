@@ -1,35 +1,48 @@
 from datetime import datetime, timezone
 import json
 import os
+import threading
+import time
 from flask import Flask, Response, request
 import requests
 
 app = Flask(__name__)
 
+# ZABEZPIECZENIE 1: Maksymalny rozmiar zapytania HTTP to 1 KB (chroni RAM na Render.com)
+app.config["MAX_CONTENT_LENGTH"] = 1024
+
 # ==============================================================================
-# KONFIGURACJA BITÓW
-# True  -> kolejność wag od lewej do prawej to: 1, 2, 4, 8, 16... (np. liczba 1 na 4 bitach to "1000")
-# False -> kolejność wag od lewej do prawej to: 8, 4, 2, 1 (np. liczba 1 na 4 bitach to "0001")
+# KONFIGURACJA
 # ==============================================================================
-LSB_FIRST = True
+LSB_FIRST = True  # True = wagi 1, 2, 4, 8 od lewej | False = wagi 8, 4, 2, 1
+SIGNAL_TIMEOUT = 30.0  # Po ilu sekundach bezczynności zresetować niedokończone wpisywanie daty
+API_COOLDOWN = (
+    1.5  # Minimalny odstęp (w sekundach) między zapytaniami do API Binance
+)
+
+# Blokada wątków (chroni przed jednoczesnym nadpisywaniem zmiennych)
+state_lock = threading.Lock()
 
 # Stan serwera
 state = {
     "post_signals": {0: None, 1: None, 2: None},
+    "last_post_time": 0.0,
+    "last_api_call": 0.0,
     "price_bcd_packets": ["00000000"] * 8,
     "get_index": 0,
 }
 
+# Cache na pobrane ceny: {"YYYY-MM-DD": 64321.50} (max 1000 wpisów, żeby nie zapchać RAMu)
+price_cache = {}
+
 
 def from_bits(bit_str):
-    """Zamienia string z bitami (0 i 1) na liczbę całkowitą z uwzględnieniem kolejności wag."""
     if LSB_FIRST:
         return int(bit_str[::-1], 2)
     return int(bit_str, 2)
 
 
 def to_bits(val, length):
-    """Zamienia liczbę całkowitą na string bitów o podanej długości z uwzględnieniem kolejności wag."""
     b = f"{val:0{length}b}"
     if LSB_FIRST:
         return b[::-1]
@@ -37,18 +50,65 @@ def to_bits(val, length):
 
 
 def format_response(bit_string):
-    """Zwraca ściśle określony JSON {"value":"00000000"} bez zbędnych spacji."""
+    """Zawsze zwraca czysty JSON oczekiwany przez Build Logic."""
     json_str = json.dumps({"value": bit_string}, separators=(",", ":"))
-    return Response(json_str, mimetype="application/json")
+    return Response(json_str, mimetype="application/json", status=200)
 
 
-def get_btc_price(day, month, year):
-    """Pobiera cenę zamknięcia BTC/USDT z danego dnia (używa endpointu odpornego na blokady USA w Render.com)."""
+def validate_date(day, month, year):
+    """Sprawdza czy data w ogóle istnieje w kalendarzu i nie jest z przyszłości."""
     try:
         dt = datetime(year, month, day, 0, 0, 0, tzinfo=timezone.utc)
-        timestamp_ms = int(dt.timestamp() * 1000)
+        now = datetime.now(timezone.utc)
 
-        # Endpoint data-api.binance.vision działa na serwerach w USA (Render.com)
+        # Anomalia: Data z przyszłości
+        if dt > now:
+            print(f"[ANOMALIA] Data z przyszłości: {day}/{month}/{year}")
+            return None
+
+        # Anomalia: Data sprzed startu rynku BTC/USDT na Binance (sierpień 2017)
+        if dt < datetime(2017, 8, 17, tzinfo=timezone.utc):
+            print(
+                f"[ANOMALIA] Data zbyt stara (przed 17.08.2017): {day}/{month}/{year}"
+            )
+            return None
+
+        return dt
+    except ValueError:
+        # Np. 31 luty, miesiąc 15, dzień 0 itp.
+        print(f"[ANOMALIA] Nieistniejąca data: {day}/{month}/{year}")
+        return None
+
+
+def get_btc_price_safe(day, month, year):
+    """Bezpieczne pobieranie ceny z Cache oraz ochroną przed spamem (Rate Limit)."""
+    dt = validate_date(day, month, year)
+    if dt is None:
+        return 0.0
+
+    date_key = f"{year:04d}-{month:02d}-{day:02d}"
+    today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # 1. Sprawdzenie pamięci Cache (jeśli data jest z przeszłości i już ją pobieraliśmy)
+    if date_key in price_cache:
+        print(
+            f"[CACHE] Pobrano cenę z pamięci dla {date_key}: {price_cache[date_key]}"
+        )
+        return price_cache[date_key]
+
+    # 2. Ochrona przed spamowaniem API (Cooldown)
+    now_ts = time.time()
+    if now_ts - state["last_api_call"] < API_COOLDOWN:
+        print(
+            "[ANTY-SPAM] Zbyt szybkie zapytania do API! Zwracam 0.0 dla ochrony IP."
+        )
+        return 0.0
+
+    state["last_api_call"] = now_ts
+
+    # 3. Zapytanie do API Binance
+    try:
+        timestamp_ms = int(dt.timestamp() * 1000)
         url = "https://data-api.binance.vision/api/v3/klines"
         params = {
             "symbol": "BTCUSDT",
@@ -56,133 +116,161 @@ def get_btc_price(day, month, year):
             "startTime": timestamp_ms,
             "limit": 1,
         }
-        res = requests.get(url, params=params, timeout=5)
-        data = res.json()
+        res = requests.get(url, params=params, timeout=4)
 
-        if isinstance(data, list) and len(data) > 0:
-            close_price = float(data[0][4])  # Cena zamknięcia z danego dnia
-            return close_price
-        else:
-            print(f"[API] Brak danych dla daty {day:02d}/{month:02d}/{year}.")
+        if res.status_code != 200:
+            print(f"[API BŁĄD] Kod HTTP: {res.status_code}")
             return 0.0
+
+        data = res.json()
+        if isinstance(data, list) and len(data) > 0:
+            close_price = float(data[0][4])
+
+            # Zapisujemy do cache tylko zamknięte dni (nie dzisiejszy)
+            if date_key != today_key:
+                if len(price_cache) > 1000:
+                    price_cache.clear()  # Czyszczenie w razie przepełnienia
+                price_cache[date_key] = close_price
+
+            return close_price
+        return 0.0
     except Exception as e:
-        print(f"[BŁĄD] Nieprawidłowa data lub problem z API ({day}/{month}/{year}): {e}")
+        print(f"[WYJĄTEK API] {e}")
         return 0.0
 
 
 def prepare_price_packets(price):
-    """Zamienia cenę (np. 64321.50) na 8 sygnałów (xxx xxx,xx):
-
-    Pierwsze 4 bity: cyfra (0-9)
-    Ostatnie 4 bity: numer sygnału (0-7)
-    """
+    """Konwertuje cenę na 8 pakietów, zabezpieczając przed przekroczeniem zakresu 999 999,99."""
+    # Zabezpieczenie przed ujemną ceną lub wyższą niż 999 999.99 (8 cyfr)
+    price = max(0.0, min(price, 999999.99))
     price_int = int(round(price * 100))
-    # Dopełnienie zerami z lewej strony do 8 cyfr (np. 64321.50 -> "06432150")
     price_str = f"{price_int:08d}"[-8:]
 
     packets = []
     for sig_num, digit_char in enumerate(price_str):
-        digit_val = int(digit_char)
-        digit_bits = to_bits(digit_val, 4)  # 4 bity dla cyfry
-        sig_bits = to_bits(sig_num, 4)  # 4 bity dla numeru sygnału (0-7)
+        digit_bits = to_bits(int(digit_char), 4)
+        sig_bits = to_bits(sig_num, 4)
         packets.append(digit_bits + sig_bits)
 
-    print(f"[CENA] {price:.2f} USD -> Pakiety do GET: {packets}")
+    print(f"[GOTOWE] Cena: {price:.2f} USD -> Pakiety: {packets}")
     return packets
 
 
 def extract_value_from_request(req):
-    """Wyciąga 8-bitowy string spod klucza 'value' niezależnie od tego jak Roblox go zakodował."""
+    """Bezpieczne wyciąganie 8 bitów z zapytania."""
+    val = None
     if "value" in req.form:
-        return req.form["value"]
-    if "value" in req.args:
-        return req.args["value"]
-
-    raw_data = req.get_data(as_text=True)
-    try:
-        parsed = json.loads(raw_data)
-        if "value" in parsed:
-            return parsed["value"]
-    except:
-        pass
-
-    # Gdy Roblox wysyła JSON jako klucz w ApplicationUrlEncoded
-    for key in req.form.keys():
+        val = req.form["value"]
+    elif "value" in req.args:
+        val = req.args["value"]
+    else:
+        raw_data = req.get_data(as_text=True)
         try:
-            parsed = json.loads(key)
-            if "value" in parsed:
-                return parsed["value"]
+            parsed = json.loads(raw_data)
+            if isinstance(parsed, dict) and "value" in parsed:
+                val = parsed["value"]
         except:
             pass
 
-    return "00000000"
+        if val is None:
+            for key in req.form.keys():
+                try:
+                    parsed = json.loads(key)
+                    if isinstance(parsed, dict) and "value" in parsed:
+                        val = parsed["value"]
+                        break
+                except:
+                    pass
+
+    if not isinstance(val, str):
+        return None
+
+    val = val.strip()
+    # Walidacja: dokładnie 8 znaków, tylko '0' i '1'
+    if len(val) == 8 and all(c in "01" for c in val):
+        return val
+    return None
 
 
 @app.route("/", methods=["POST", "GET"])
 def handle_transmitter():
-    # ==========================================
-    # ODBIERANIE DATY (POST)
-    # ==========================================
-    if request.method == "POST":
-        val = extract_value_from_request(request).strip()
-        print(f"[POST] Odebrano bity: {val}")
+    with state_lock:
+        # ==========================================
+        # ODBIERANIE DATY (POST)
+        # ==========================================
+        if request.method == "POST":
+            val = extract_value_from_request(request)
 
-        if len(val) != 8 or not all(c in "01" for c in val):
-            print("[BŁĄD] Odebrana wartość nie ma 8 bitów!")
-            return format_response("11111111")
+            # Anomalia: Uszkodzony pakiet (zła długość lub inne znaki niż 0/1)
+            if val is None:
+                print(
+                    "[ANOMALIA] Odebrano nieprawidłowe dane w POST! Zwracam kod błędu (Sygnał 3)."
+                )
+                return format_response("000000" + to_bits(3, 2))
 
-        # Ostatnie 2 bity (indeksy 6 i 7) to numer sygnału (0, 1 lub 2)
-        sig_num = from_bits(val[6:8])
+            now = time.time()
+            # Jeśli minęło więcej niż 30 sekund od ostatniego POSTa, czyścimy stare niedokończone sygnały
+            if now - state["last_post_time"] > SIGNAL_TIMEOUT:
+                state["post_signals"] = {0: None, 1: None, 2: None}
+            state["last_post_time"] = now
 
-        if sig_num in [0, 1, 2]:
+            sig_num = from_bits(val[6:8])
+
+            # Sygnał nr 3 (bity '11' na końcu) działa jako RĘCZNY RESET układu
+            if sig_num == 3:
+                print(
+                    "[RESET] Odebrano sygnał #3 -> Czyszczenie bufora i reset indeksów!"
+                )
+                state["post_signals"] = {0: None, 1: None, 2: None}
+                state["get_index"] = 0
+                return format_response("000000" + to_bits(3, 2))
+
+            # Jeśli przychodzi Sygnał 0, a w buforze są jakieś śmieci z poprzedniej próby, zaczynamy od nowa
+            if sig_num == 0 and any(
+                state["post_signals"][i] is not None for i in [1, 2]
+            ):
+                print("[NOWA SEKWENCJA] Nadpisuję niedokończoną datę od sygnału #0.")
+                state["post_signals"] = {0: None, 1: None, 2: None}
+
             state["post_signals"][sig_num] = val
-            print(f" -> Zapisano jako Sygnał #{sig_num}")
-        else:
-            print(f" -> [UWAGA] Numer sygnału {sig_num} spoza zakresu 0-2!")
+            print(f"[POST] Odebrano poprawny Sygnał #{sig_num}: {val}")
 
-        # Sprawdzamy czy mamy już komplet 3 sygnałów (0, 1 oraz 2)
-        if all(state["post_signals"][i] is not None for i in [0, 1, 2]):
-            s0 = state["post_signals"][0]
-            s1 = state["post_signals"][1]
-            s2 = state["post_signals"][2]
+            # Sprawdzamy czy mamy komplet 3 sygnałów (0, 1, 2)
+            if all(state["post_signals"][i] is not None for i in [0, 1, 2]):
+                s0 = state["post_signals"][0]
+                s1 = state["post_signals"][1]
+                s2 = state["post_signals"][2]
 
-            # Składanie bitów wg schematu: 5(0:0-4) / 4(0:5, 1:0-2) / 7(1:3-5, 2:0-3)
-            day_bits = s0[0:5]  # 5 bitów dnia
-            month_bits = s0[5] + s1[0:3]  # 4 bity miesiąca
-            year_bits = s1[3:6] + s2[0:4]  # 7 bitów roku
+                day = from_bits(s0[0:5])
+                month = from_bits(s0[5] + s1[0:3])
+                year = 2000 + from_bits(s1[3:6] + s2[0:4])
 
-            day = from_bits(day_bits)
-            month = from_bits(month_bits)
-            year = 2000 + from_bits(year_bits)
+                print(f"=== ZDEKODOWANO DATĘ: {day:02d}/{month:02d}/{year} ===")
 
-            print(f"=== ZDEKODOWANO DATĘ: {day:02d}/{month:02d}/{year} ===")
+                price = get_btc_price_safe(day, month, year)
+                state["price_bcd_packets"] = prepare_price_packets(price)
+                state["get_index"] = 0
+                state["post_signals"] = {0: None, 1: None, 2: None}
 
-            # Pobieramy cenę BTC i generujemy 8 pakietów odpowiedzi
-            price = get_btc_price(day, month, year)
-            state["price_bcd_packets"] = prepare_price_packets(price)
-            state["get_index"] = 0  # Resetujemy indeks dla nadchodzących zapytań GET
+            # Zwracamy numer sygnału dla weryfikacji
+            return format_response("000000" + to_bits(sig_num, 2))
 
-            # Czyścimy odebrane sygnały pod kolejne zapytanie
-            state["post_signals"] = {0: None, 1: None, 2: None}
+        # ==========================================
+        # WYSYŁANIE CENY DO GRY (GET)
+        # ==========================================
+        elif request.method == "GET":
+            idx = state["get_index"]
+            packet_to_send = state["price_bcd_packets"][idx]
+            print(f"[GET] Wysyłam pakiet #{idx}/7: {packet_to_send}")
+            state["get_index"] = (idx + 1) % 8
+            return format_response(packet_to_send)
 
-        # Zwracamy numer odebranego sygnału na dwóch ostatnich bitach dla weryfikacji
-        verification_response = "000000" + to_bits(sig_num, 2)
-        print(f"[POST] Zwracam weryfikację: {verification_response}")
-        return format_response(verification_response)
 
-    # ==========================================
-    # WYSYŁANIE CENY DO GRY (GET)
-    # ==========================================
-    elif request.method == "GET":
-        idx = state["get_index"]
-        packet_to_send = state["price_bcd_packets"][idx]
-
-        print(f"[GET] Wysyłam pakiet #{idx}/7: {packet_to_send}")
-
-        # Przechodzimy do kolejnego pakietu (0 -> 1 -> ... -> 7 -> 0)
-        state["get_index"] = (idx + 1) % 8
-
-        return format_response(packet_to_send)
+# ZABEZPIECZENIE GLOBALNE: Nawet jak wydarzy się coś nieprzewidzianego, nie wywalaj serwera
+@app.errorhandler(Exception)
+def handle_exception(e):
+    print(f"[KRYTYCZNY WYJĄTEK] {e}")
+    return format_response("00000011")
 
 
 if __name__ == "__main__":
